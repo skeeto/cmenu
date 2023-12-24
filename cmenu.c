@@ -1,63 +1,107 @@
-#include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
-#include <ctype.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 
 
-#define ENTRY_MAX     512
-#define ENTRIES_MAX   512
-#define PATTERN_MAX   512
+#define MEMORY_MAX    (1<<28)  /* 256 MiB */
+#define PATTERN_MAX   (1<<12)  /* 4KiB */
 
-#define KEY_DOWN      0x425B1B
-#define KEY_UP        0x415B1B
-#define KEY_ENTER     0xD
+#define KEY_ESCAPE0   0x1B
+#define KEY_ESCAPE1   0x5B
+#define KEY_DOWN      0x42
+#define KEY_UP        0x41
+#define KEY_ENTER     0x0D
 #define KEY_CTRLC     0x03
 #define KEY_BACKSPACE 0x7F
-#define USAGE_STR     "usage: cmenu <OUTPUT_FILE> [-r|--remove]"
+
+#define NEW(arena, type, count) \
+    (type*)alloc(arena, sizeof(type), count)
 
 #define ERROR_EXIT(msg) \
-    do { puts(msg); exit(EXIT_FAILURE); } while (0)
+    do { writestr(2, msg "\n"); exit(EXIT_FAILURE); } while (0)
 
 
-char** g_entries       = NULL;
-char** g_matches       = NULL;
-int    g_entries_len   = 0;
-int    g_matches_len   = 0;
-int    g_selected      = 0;
-int    g_height        = 0;
-struct termios g_termios_original;
+typedef struct {
+    char* beg;
+    char* end;
+} Arena;
 
 
-void clear_screen(void) {
-    system("clear");
+typedef struct {
+    int    tty;
+    int    height;
+    struct termios original;
+} Terminal;
+
+
+typedef struct {
+    char** entries;
+    int*   matches;
+    int    entries_len;
+    int    matches_len;
+    int    selected;
+} Entries;
+
+
+int fullread(int fd, void* buf, ptrdiff_t len) {
+    ptrdiff_t r, off;
+
+    for (off = 0; off < len;) {
+        r = read(fd, (char*)buf+off, len-off);
+        if (r < 1) {
+            break;
+        }
+        off += r;
+    }
+    return off;
 }
 
 
-int read_entry(char** dest) {
-    char buf[ENTRY_MAX];
-    char ch;
-    int  i;
+int fullwrite(int fd, void* buf, ptrdiff_t len) {
+    ptrdiff_t r, off;
 
-    i = 0;
-    *dest = NULL;
-    while ((ch = fgetc(stdin)) != EOF) {
-        if (ch != '\n' && i < (ENTRY_MAX - 1)) {
-            buf[i++] = ch;
-        } else {
-            break;
+    for (off = 0; off < len;) {
+        r = write(fd, (char*)buf+off, len-off);
+        if (r < 1) {
+            return -1;
         }
+        off += r;
     }
+    return 0;
+}
 
-    if (i > 0) {
-        buf[i] = '\0';
-        *dest = strdup(buf);
+
+int writestr(int fd, char* str) {
+    return fullwrite(fd, str, strlen(str));
+}
+
+
+/* Given a non-zero count, the first item will be zeroed. */
+void* alloc(Arena* arena, ptrdiff_t size, ptrdiff_t count) {
+    void*     ptr;
+    ptrdiff_t available;
+
+    available = arena->end - arena->beg;
+    if (count > available/size) {
+        ERROR_EXIT("out of memory");
     }
+    ptr = arena->end -= size * count;
+    return count ? memset(ptr, 0, size) : ptr;
+}
 
-    return ch == EOF ? 1 : 0;
+
+void clear_screen(Terminal* term) {
+    writestr(term->tty, "\x1b[H\x1b[2J\x1b[3J");
+}
+
+
+char xtolower(char c) {
+    return ((unsigned)c-'A' < 26) ? c+'a'-'A' : c;
 }
 
 
@@ -65,7 +109,7 @@ bool is_match(char* pattern, char* str) {
     if (*pattern == '\0')
         return true;
 
-    while ((tolower(*(pattern++)) == tolower(*(str++)))) {
+    while (*(pattern++) == xtolower(*(str++))) {
         if (*pattern == '\0')
             return true;
         else if (*str == '\0')
@@ -76,111 +120,133 @@ bool is_match(char* pattern, char* str) {
 }
 
 
-void restore_terminal_mode(void) {
-    tcsetattr(0, TCSANOW, &g_termios_original);
+void restore_terminal_mode(Terminal* term) {
+    tcsetattr(term->tty, TCSANOW, &term->original);
 }
 
 
-void set_terminal_mode(void) {
+void set_terminal_mode(Terminal* term) {
     struct termios termios_new;
 
-    tcgetattr(0, &g_termios_original);
-    memcpy(&termios_new, &g_termios_original, sizeof termios_new);
+    tcgetattr(term->tty, &term->original);
+    memcpy(&termios_new, &term->original, sizeof termios_new);
 
     cfmakeraw(&termios_new);
-    tcsetattr(0, TCSANOW, &termios_new);
+    tcsetattr(term->tty, TCSANOW, &termios_new);
 }
 
 
-bool key_pressed(void) {
-    fd_set fds;
-    struct timeval tv;
+Entries* read_entries(Arena* arena) {
+    char*     input;
+    ptrdiff_t input_len, input_off, entry_len, i;
+    Entries*  e;
 
-    tv.tv_sec  = 0;
-    tv.tv_usec = 0;
+    e = NEW(arena, Entries, 1);
 
-    FD_ZERO(&fds);
-    FD_SET(0, &fds);
+    input = arena->beg;
+    input_len = arena->end - arena->beg;
+    input_len = fullread(0, arena->beg, input_len-1);
+    input[input_len++] = '\n';
+    arena->beg += input_len;
 
-    return select(1, &fds, NULL, NULL, &tv) > 0;
-}
-
-
-void read_entries(void) {
-    char* entries[ENTRIES_MAX];
-    char* entry;
-    int   i, size, code;
-
-    i = 0;
-    while (1) {
-        code = read_entry(&entry);
-
-        if (i > ENTRIES_MAX - 1)
-            ERROR_EXIT("Too many entries.");
-
-        if (entry) {
-            entries[i++] = entry;
-            size += sizeof(char**);
-        }
-
-        if (code)
+    /* Count non-empty lines */
+    entry_len = 0;
+    for (input_off = 0; input_off < input_len; input_off++) {
+        switch (input[input_off]) {
+        case '\0':
+        case '\n':
+        case '\r':
+            e->entries_len += entry_len > 0;
+            entry_len = 0;
             break;
+        default:
+            entry_len++;
+        }
     }
 
-    g_entries     = malloc(size);
-    g_matches     = malloc(size);
-    g_entries_len = i;
+    e->entries = NEW(arena, char*, e->entries_len);
+    e->matches = NEW(arena, int, e->entries_len);
 
-    if ( !(g_entries && g_matches) )
-        ERROR_EXIT("malloc failed");
+    /* Chop lines up into entries */
+    i = 0;
+    entry_len = 0;
+    for (input_off = 0; input_off < input_len; input_off++) {
+        switch (input[input_off]) {
+        case '\0':
+        case '\n':
+        case '\r':
+            input[input_off] = 0;
+            if (entry_len > 0) {
+                e->entries[i++] = input + input_off - entry_len;
+            }
+            entry_len = 0;
+            break;
+        default:
+            entry_len++;
+        }
+    }
 
-    memcpy(g_entries, entries, size);
-    freopen("/dev/tty", "r", stdin);
+    return e;
 }
 
 
-void set_selected_clamped(int n) {
-    g_selected =  ((n < 0) ? 0 : n >= g_matches_len ? g_matches_len - 1 : n);
+void set_selected_clamped(Entries* e, int n) {
+    e->selected = ((n < 0) ? 0 : n >= e->matches_len ? e->matches_len - 1 : n);
 }
 
 
-void update_matches(char* pattern) {
-    int i;
+void update_matches(Entries* e, char* pattern, Arena scratch) {
+    char* copy;
+    int   i, len;
 
-    g_matches_len = 0;
-    for (i = 0; i < g_entries_len; ++i) {
-        if (is_match(pattern, g_entries[i]))
-            g_matches[g_matches_len++] = g_entries[i];
+    len = strlen(pattern) + 1;
+    copy = NEW(&scratch, char, len);
+    for (i = 0; i < len; i++) {
+        copy[i] = xtolower(pattern[i]);
+    }
+
+    e->matches_len = 0;
+    for (i = 0; i < e->entries_len; ++i) {
+        if (is_match(pattern, e->entries[i]))
+            e->matches[e->matches_len++] = i;
     }
 }
 
 
-int getch(void) {
-    char buf[4] = {0};
-    return (read(0, buf, 4) != -1) ? *(int*) buf : -1;
+int getch(Terminal* term) {
+    char r;
+
+    if (read(term->tty, &r, 1) == -1) {
+        ERROR_EXIT("tty input error");
+    }
+    return r & 255;
 }
 
 
-void draw(char* pattern) {
+void draw(Terminal* term, Entries* e, char* pattern, Arena scratch) {
     int i, j;
 
-    update_matches(pattern);
-    set_selected_clamped(g_selected);
-    clear_screen();
+    update_matches(e, pattern, scratch);
+    set_selected_clamped(e, e->selected);
+    clear_screen(term);
 
-    printf(">%s\n", pattern);
+    writestr(term->tty, ">");
+    writestr(term->tty, pattern);
+    writestr(term->tty, "\n");
 
-    if (g_selected > g_height - 3) {
-        i = g_selected - (g_height - 3);
+    if (e->selected > term->height - 3) {
+        i = e->selected - (term->height - 3);
     } else {
         i = 0;
     }
 
-    for (j = 0; i < g_matches_len; ++i) {
-        if (++j == g_height - 1)
+    for (j = 0; i < e->matches_len; ++i) {
+        if (++j == term->height - 1)
             break;
 
-        printf("%s%s\n", g_matches[i], i == g_selected ? " (*)" : "");
+        writestr(term->tty, e->entries[e->matches[i]]);
+        writestr(term->tty, i == e->selected ? " (*)" : "");
+        writestr(term->tty, "\n");
     }
 }
 
@@ -190,111 +256,102 @@ bool ch_isvalid(char ch) {
 }
 
 
-void select_next(void) {
-    set_selected_clamped(--g_selected);
+void select_next(Entries* e) {
+    set_selected_clamped(e, --e->selected);
 }
 
 
-void select_prev(void) {
-    set_selected_clamped(++g_selected);
+void select_prev(Entries* e) {
+    set_selected_clamped(e, ++e->selected);
 }
 
 
-void get_terminal_height(void) {
+Terminal* get_terminal(Arena* arena) {
+    Terminal* term;
     struct winsize w;
-    ioctl(0, TIOCGWINSZ, &w);
-    g_height = w.ws_row;
-}
 
+    term = NEW(arena, Terminal, 1);
 
-int main(int argc, char** argv) {
-    FILE* fp;
-    char  pattern[PATTERN_MAX];
-    char* selected_entry;
-    int   ch, pattern_len;
-
-    switch (argc)
-    {
-    case 2:
-        break;
-
-    case 3:
-        if (strcmp(argv[2], "-r") == 0 || strcmp(argv[2], "--remove") == 0) {
-            if (access(argv[1], F_OK) == -1)
-                ERROR_EXIT("file does not exist");
-
-            if ( (fp = fopen(argv[1], "r")) ) {
-                while ((ch = fgetc(fp)) != EOF)
-                    putchar(ch);
-
-                fclose(fp);
-            }
-
-            unlink(argv[1]);
-            return EXIT_SUCCESS;
-        } else {
-            ERROR_EXIT(USAGE_STR);
-        }
-
-    default:
-        ERROR_EXIT(USAGE_STR);
+    term->tty = open("/dev/tty", O_RDWR);
+    if (term->tty == -1) {
+        ERROR_EXIT("could not open /dev/tty");
     }
 
-    read_entries();
-    get_terminal_height();
-    draw("");
-    set_terminal_mode();
+    ioctl(term->tty, TIOCGWINSZ, &w);
+    term->height = w.ws_row;
 
-    ch = pattern_len = 0;
+    return term;
+}
+
+
+int main(void) {
+    char*     pattern;
+    char*     selected_entry;
+    int       i, ch, pattern_len;
+    Arena     arena[1];
+    Entries*  entries;
+    Terminal* term;
+
+    arena->beg = malloc(MEMORY_MAX);
+    if (!arena->beg) {
+        arena->end = arena->beg = (void*)16;  /* zero-sized, but non-null */
+    } else {
+        arena->end = arena->beg + MEMORY_MAX;
+    }
+
+    entries = read_entries(arena);
+    term = get_terminal(arena);
+    draw(term, entries, "", *arena);
+    set_terminal_mode(term);
+
+    pattern = NEW(arena, char, PATTERN_MAX);
+
+    pattern_len = 0;
     selected_entry = NULL;
     while (1) {
-        if (key_pressed()) {
-            switch (ch = getch())
-            {
-            case KEY_CTRLC: goto end;
-            case KEY_UP:    select_next(); break;
-            case KEY_DOWN:  select_prev(); break;
-            case KEY_BACKSPACE:
-                if ((pattern_len - 1) > -1)
-                    --pattern_len;
-
-                pattern[pattern_len] = '\0';
-                break;
-            case KEY_ENTER:
-                if (g_matches_len > 0)
-                    selected_entry = g_matches[g_selected];
-
-                goto end;
-
-            default:
-                if (ch_isvalid(ch)) {
-                    pattern[pattern_len++] = ch;
-                    if (pattern_len >= PATTERN_MAX - 1)
-                        ERROR_EXIT("pattern too long");
-
-                    pattern[pattern_len] = '\0';
-                } else {
-                    continue;
+        ch = getch(term);
+        if (KEY_ENTER == ch) {
+            if (entries->matches_len > 0) {
+                i = entries->matches[entries->selected];
+                selected_entry = entries->entries[i];
+            }
+            goto end;
+        } else if (KEY_CTRLC == ch) {
+            goto end;
+        } else if (KEY_BACKSPACE == ch) {
+            if ((pattern_len - 1) > -1)
+                --pattern_len;
+            pattern[pattern_len] = '\0';
+        } else if (KEY_ESCAPE0 == ch) {
+            ch = getch(term);
+            if (KEY_ESCAPE1 == ch) {
+                switch (getch(term)) {
+                case KEY_UP:   select_next(entries); break;
+                case KEY_DOWN: select_prev(entries); break;
                 }
             }
-
-            restore_terminal_mode();
-            draw(pattern_len == 0 ? "" : pattern);
-            set_terminal_mode();
+        } else {
+            if (ch_isvalid(ch)) {
+                pattern[pattern_len++] = ch;
+                if (pattern_len >= PATTERN_MAX - 1)
+                    ERROR_EXIT("pattern too long");
+                pattern[pattern_len] = '\0';
+            } else {
+                continue;
+            }
         }
+
+        restore_terminal_mode(term);
+        draw(term, entries, pattern_len == 0 ? "" : pattern, *arena);
+        set_terminal_mode(term);
     }
 
 end:
-    if (selected_entry) {
-        if (access(argv[1], F_OK) != -1)
-            ERROR_EXIT("file already exists");
+    restore_terminal_mode(term);
 
-        if ( (fp = fopen(argv[1], "w+")) ) {
-            fputs(selected_entry, fp);
-            fclose(fp);
-        }
+    if (selected_entry) {
+        writestr(1, selected_entry);
     }
 
-    restore_terminal_mode();
     return EXIT_SUCCESS;
 }
